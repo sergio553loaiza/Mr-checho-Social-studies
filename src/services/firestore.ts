@@ -457,8 +457,8 @@ export function subscribeToTeacherDashboard(
 export type StudentRosterEntry = {
   email: string;
   name: string;
-  group: StudentGroup;
-  grade: ActivityGrade;
+  group: StudentGroup | null;
+  grade: ActivityGrade | null;
   active: boolean;
 };
 
@@ -471,25 +471,33 @@ export async function seedStudentRoster(
 ): Promise<number> {
   const rosterRef = collection(db, 'student_roster');
   const batch = writeBatch(db);
+  let createdCount = 0;
 
   for (const student of roster) {
     const email = student.email.toLowerCase().trim();
+    const studentRef = doc(rosterRef, email);
+    const existing = await getDoc(studentRef);
 
-    batch.set(
-      doc(rosterRef, email),
-      {
-        email,
-        name: student.name,
-        group: student.group,
-        grade: student.grade,
-        active: student.active,
-      },
-      { merge: true }
-    );
+    // Never reset a teacher's manual changes (especially active=false).
+    if (existing.exists()) {
+      continue;
+    }
+
+    batch.set(studentRef, {
+      email,
+      name: student.name,
+      group: student.group,
+      grade: student.grade,
+      active: student.active,
+    });
+    createdCount++;
   }
 
-  await batch.commit();
-  return roster.length;
+  if (createdCount > 0) {
+    await batch.commit();
+  }
+
+  return createdCount;
 }
 
 /**
@@ -498,8 +506,8 @@ export async function seedStudentRoster(
  */
 export async function updateStudentRosterEntry(
   email: string,
-  group: StudentGroup,
-  grade: ActivityGrade
+  group: StudentGroup | null,
+  grade: ActivityGrade | null
 ): Promise<void> {
   const normalizedEmail = email.toLowerCase().trim();
 
@@ -662,11 +670,6 @@ export async function saveColombianSymbolsProgress(
       answers: {},
       totalQuestions: 10,
       score: 0,
-      percentage: 0,
-      ...updateData,
-    } as ActivityAttempt;
-  }
-}
       percentage: 0,
       ...updateData,
     } as ActivityAttempt;
