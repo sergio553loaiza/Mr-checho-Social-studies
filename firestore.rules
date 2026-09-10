@@ -1,54 +1,134 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // =========================================================
+    // AUTHENTICATION
+    // =========================================================
 
     function isAuthenticated() {
       return request.auth != null;
     }
 
     function isTeacher() {
-      return isAuthenticated() && 
-        request.auth.token.email != null &&
-        request.auth.token.email.lower() == 'sergio553.loaiza@montessori.edu.co';
+      return isAuthenticated()
+        && request.auth.token.email != null
+        && request.auth.token.email.lower()
+          == 'sergio553.loaiza@montessori.edu.co';
     }
 
     function isOwner(uid) {
-      return isAuthenticated() && request.auth.uid == uid;
+      return isAuthenticated()
+        && request.auth.uid == uid;
     }
 
+
+    // =========================================================
+    // STUDENT ROSTER
+    // =========================================================
+    //
+    // The roster is the official list of students.
+    // Only the teacher can create, edit or delete roster records.
+    //
+    // Students may read ONLY their own roster record.
+    //
+
+    match /student_roster/{emailId} {
+
+      allow read: if isTeacher()
+        || (
+          isAuthenticated()
+          && resource.data.email == request.auth.token.email
+        );
+
+      allow create, update, delete: if isTeacher();
+    }
+
+
+    // =========================================================
+    // USERS
+    // =========================================================
+    //
+    // Teacher can manage all users.
+    //
+    // Students can read their own profile.
+    //
+    // IMPORTANT:
+    // Students are no longer allowed to create their own
+    // user profile. The application will create/update the
+    // profile only after checking the official roster.
+    //
+
     match /users/{uid} {
-      // Teacher can read all users and manage profiles
-      // Students can read and update only their own profile
+
       allow read: if isTeacher() || isOwner(uid);
-      allow create, update: if isTeacher() || isOwner(uid);
+
+      allow create: if isTeacher()
+        || (
+          isOwner(uid)
+          && isAuthenticated()
+          && exists(
+            /databases/$(database)/documents/student_roster/$(request.auth.token.email.lower())
+          )
+          && get(
+            /databases/$(database)/documents/student_roster/$(request.auth.token.email.lower())
+          ).data.active == true
+        );
+
+      allow update: if isTeacher()
+        || isOwner(uid);
+
       allow delete: if isTeacher();
     }
 
+
+    // =========================================================
+    // ACTIVITY ATTEMPTS
+    // =========================================================
+
     match /activity_attempts/{attemptId} {
-      // Teacher can read, create, update, delete all activity attempts
-      // Students can read their own attempts or check attempts with their ID prefix
-      allow get: if isTeacher() || (
-        isAuthenticated() && (
-          resource == null || 
-          resource.data.studentUid == request.auth.uid ||
-          attemptId.matches('^' + request.auth.uid + '_.*')
-        )
-      );
-      allow list: if isTeacher() || (
-        isAuthenticated() && resource.data.studentUid == request.auth.uid
-      );
-      
-      allow create: if isTeacher() || (
-        isAuthenticated() && 
-        request.resource.data.studentUid == request.auth.uid
-      );
-      
-      allow update: if isTeacher() || (
-        isAuthenticated() && 
-        (resource == null || resource.data.studentUid == request.auth.uid) &&
-        request.resource.data.studentUid == request.auth.uid
-      );
-      
+
+      // Teacher can access everything.
+      // Students can access only their own attempts.
+
+      allow get: if isTeacher()
+        || (
+          isAuthenticated()
+          && (
+            resource == null
+            || resource.data.studentUid == request.auth.uid
+            || attemptId.matches(
+              '^' + request.auth.uid + '_.*'
+            )
+          )
+        );
+
+      allow list: if isTeacher()
+        || (
+          isAuthenticated()
+          && resource.data.studentUid == request.auth.uid
+        );
+
+      allow create: if isTeacher()
+        || (
+          isAuthenticated()
+          && request.resource.data.studentUid == request.auth.uid
+          && exists(
+            /databases/$(database)/documents/student_roster/$(request.auth.token.email.lower())
+          )
+          && get(
+            /databases/$(database)/documents/student_roster/$(request.auth.token.email.lower())
+          ).data.active == true
+        );
+
+      allow update: if isTeacher()
+        || (
+          isAuthenticated()
+          && resource.data.studentUid == request.auth.uid
+          && request.resource.data.studentUid == request.auth.uid
+        );
+
       allow delete: if isTeacher();
     }
   }
