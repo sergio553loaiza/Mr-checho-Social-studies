@@ -1,0 +1,6 @@
+{
+  "name": "Mr Checho's Social Studies Lab 2.0",
+  "description": "Interactive Social Studies learning platform for Montessori elementary students.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

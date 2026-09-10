@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isTeacher() {
+      return isAuthenticated() && 
+        request.auth.token.email != null &&
+        request.auth.token.email.lower() == 'sergio553.loaiza@montessori.edu.co';
+    }
+
+    function isOwner(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    match /users/{uid} {
+      // Teacher can read all users and manage profiles
+      // Students can read and update only their own profile
+      allow read: if isTeacher() || isOwner(uid);
+      allow create, update: if isTeacher() || isOwner(uid);
+      allow delete: if isTeacher();
+    }
+
+    match /activity_attempts/{attemptId} {
+      // Teacher can read, create, update, delete all activity attempts
+      // Students can read their own attempts or check attempts with their ID prefix
+      allow get: if isTeacher() || (
+        isAuthenticated() && (
+          resource == null || 
+          resource.data.studentUid == request.auth.uid ||
+          attemptId.matches('^' + request.auth.uid + '_.*')
+        )
+      );
+      allow list: if isTeacher() || (
+        isAuthenticated() && resource.data.studentUid == request.auth.uid
+      );
+      
+      allow create: if isTeacher() || (
+        isAuthenticated() && 
+        request.resource.data.studentUid == request.auth.uid
+      );
+      
+      allow update: if isTeacher() || (
+        isAuthenticated() && 
+        (resource == null || resource.data.studentUid == request.auth.uid) &&
+        request.resource.data.studentUid == request.auth.uid
+      );
+      
+      allow delete: if isTeacher();
+    }
+  }
+}
