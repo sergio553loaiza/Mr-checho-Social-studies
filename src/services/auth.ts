@@ -10,6 +10,7 @@ import { AppUser, UserRole, ActivityGrade, StudentGroup, getGradeFromGroup } fro
 
 const STUDENT_DOMAIN = '@s.montessori.edu.co';
 const TEACHER_DOMAIN = '@montessori.edu.co';
+const TEACHER_EMAIL = 'sergio553.loaiza@montessori.edu.co';
 
 export function isAuthorizedEmail(email: string | null | undefined): boolean {
   if (!email) return false;
@@ -102,11 +103,46 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<AppUser> {
     );
   }
 
+  const normalizedEmail = (fbUser.email || '').toLowerCase().trim();
+  const role = determineUserRole(normalizedEmail);
+  const now = new Date().toISOString();
+
+  // The teacher account is authorized by institutional teacher domain.
+  // Student accounts are authorized by the official student roster.
+  let rosterGroup: StudentGroup | null = null;
+  let rosterGrade: ActivityGrade | null = null;
+
+  if (role === 'student') {
+    const rosterRef = doc(db, 'student_roster', normalizedEmail);
+    const rosterSnap = await getDoc(rosterRef);
+
+    if (!rosterSnap.exists()) {
+      await firebaseSignOut(auth);
+      throw new Error(
+        'Tu cuenta no está en el roster activo de Montessori.'
+      );
+    }
+
+    const rosterData = rosterSnap.data();
+
+    if (rosterData.active !== true) {
+      await firebaseSignOut(auth);
+      throw new Error(
+        'Tu cuenta no está en el roster activo de Montessori.'
+      );
+    }
+
+    rosterGroup = (rosterData.group || null) as StudentGroup | null;
+    rosterGrade = (rosterData.grade || null) as ActivityGrade | null;
+
+    // If the roster has a group but no grade, derive the grade from the group.
+    if (!rosterGrade && rosterGroup) {
+      rosterGrade = getGradeFromGroup(rosterGroup);
+    }
+  }
+
   const userRef = doc(db, 'users', fbUser.uid);
   const userSnap = await getDoc(userRef);
-
-  const role = determineUserRole(fbUser.email);
-  const now = new Date().toISOString();
 
   const storedLocalGroup = typeof window !== 'undefined'
     ? (
@@ -122,14 +158,28 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<AppUser> {
   if (userSnap.exists()) {
     const data = userSnap.data();
 
+    // For students, the roster is authoritative.
+    // Old users/localStorage values are used only when the roster
+    // does not provide a value.
     const effectiveGroup: StudentGroup | undefined =
-      data.studentGroup || storedLocalGroup || undefined;
+      role === 'student'
+        ? (rosterGroup || storedLocalGroup || undefined)
+        : (data.studentGroup || storedLocalGroup || undefined);
 
     const effectiveGrade: ActivityGrade | undefined =
-      data.selectedGrade ||
-      (effectiveGroup ? getGradeFromGroup(effectiveGroup) : undefined) ||
-      storedLocalGrade ||
-      undefined;
+      role === 'student'
+        ? (
+            rosterGrade ||
+            (effectiveGroup ? getGradeFromGroup(effectiveGroup) : undefined) ||
+            storedLocalGrade ||
+            undefined
+          )
+        : (
+            data.selectedGrade ||
+            (effectiveGroup ? getGradeFromGroup(effectiveGroup) : undefined) ||
+            storedLocalGrade ||
+            undefined
+          );
 
     const updatedUser: AppUser = {
       uid: fbUser.uid,
@@ -140,7 +190,6 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<AppUser> {
       email: fbUser.email || data.email || '',
       photoURL: fbUser.photoURL || data.photoURL || null,
 
-      // IMPORTANT:
       // The role is determined from the institutional email domain.
       // We do not trust a previously stored role from Firestore.
       role,
@@ -188,14 +237,26 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<AppUser> {
 
     return updatedUser;
   } else {
-    const effectiveGroup = storedLocalGroup || undefined;
+    // At this point, a student has already passed the roster check above.
+    // For students, only roster values may establish the initial group/grade.
+    const effectiveGroup =
+      role === 'student'
+        ? (rosterGroup || undefined)
+        : (storedLocalGroup || undefined);
 
     const effectiveGrade =
-      (effectiveGroup
-        ? getGradeFromGroup(effectiveGroup)
-        : undefined) ||
-      storedLocalGrade ||
-      undefined;
+      role === 'student'
+        ? (
+            rosterGrade ||
+            (effectiveGroup ? getGradeFromGroup(effectiveGroup) : undefined)
+          )
+        : (
+            (effectiveGroup
+              ? getGradeFromGroup(effectiveGroup)
+              : undefined) ||
+            storedLocalGrade ||
+            undefined
+          );
 
     const newUser: AppUser = {
       uid: fbUser.uid,
@@ -220,6 +281,13 @@ export async function syncUserProfile(fbUser: FirebaseUser): Promise<AppUser> {
       localStorage.removeItem('mrchecho_pending_group');
     }
 
+    if (effectiveGrade && typeof window !== 'undefined') {
+      localStorage.setItem(
+        `mrchecho_grade_${fbUser.uid}`,
+        effectiveGrade
+      );
+    }
+
     await setDoc(userRef, newUser, { merge: true });
 
     return newUser;
@@ -235,7 +303,6 @@ export function subscribeToAuth(
         // Security check for existing Firebase sessions.
         if (!isAuthorizedEmail(fbUser.email)) {
           await firebaseSignOut(auth);
-
           callback(null, false);
           return;
         }
@@ -248,27 +315,11 @@ export function subscribeToAuth(
           err
         );
 
-        // If the account is not authorized, do not create
-        // a fallback user. Keep the application logged out.
-        if (!isAuthorizedEmail(fbUser.email)) {
-          await firebaseSignOut(auth);
-          callback(null, false);
-          return;
-        }
-
-        const role = determineUserRole(fbUser.email);
-
-        const fallbackUser: AppUser = {
-          uid: fbUser.uid,
-          name: fbUser.displayName || 'Montessori Student',
-          email: fbUser.email || '',
-          photoURL: fbUser.photoURL,
-          role,
-          createdAt: new Date().toISOString(),
-          lastLoginAt: new Date().toISOString(),
-        };
-
-        callback(fallbackUser, false);
+        // Never create a fallback user after an authentication/roster error.
+        // This is important because an old users/{uid} document must not
+        // bypass the official student roster.
+        await firebaseSignOut(auth).catch(() => undefined);
+        callback(null, false);
       }
     } else {
       callback(null, false);
