@@ -1,24 +1,62 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Mail, Calendar, CheckCircle2, Search, ShieldCheck, GraduationCap, Filter, Check } from 'lucide-react';
+import { Users, Search, GraduationCap, Filter, Check, UserX, UserCheck, UploadCloud } from 'lucide-react';
 import { AppUser, ActivityAttempt, StudentGroup, STUDENT_GROUPS } from '../types';
-import { subscribeToUsers, subscribeToTeacherDashboard } from '../services/firestore';
+import {
+  subscribeToUsers,
+  subscribeToTeacherDashboard,
+  subscribeToStudentRoster,
+  seedStudentRoster,
+  updateStudentRosterEntry,
+  setStudentRosterActive,
+  StudentRosterEntry,
+} from '../services/firestore';
 import { updateUserGroup } from '../services/auth';
+import { OFFICIAL_STUDENT_ROSTER } from '../studentRosterData';
 
 type GroupFilter = 'ALL' | StudentGroup | 'UNASSIGNED';
 
 export const TeacherStudentsView: React.FC = () => {
   const [users, setUsers] = useState<AppUser[]>([]);
+  const [roster, setRoster] = useState<StudentRosterEntry[]>([]);
   const [attempts, setAttempts] = useState<ActivityAttempt[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [search, setSearch] = useState<string>('');
   const [activeGroupFilter, setActiveGroupFilter] = useState<GroupFilter>('ALL');
-  const [updatingUid, setUpdatingUid] = useState<string | null>(null);
+  const [updatingKey, setUpdatingKey] = useState<string | null>(null);
+  const [seedingRoster, setSeedingRoster] = useState<boolean>(false);
+  const [rosterError, setRosterError] = useState<string | null>(null);
+  const [showInactive, setShowInactive] = useState<boolean>(false);
 
   useEffect(() => {
     setLoading(true);
+    setRosterError(null);
+
+    // Load the official roster and seed it once from the teacher account.
+    const loadRoster = async () => {
+      try {
+        setSeedingRoster(true);
+        await seedStudentRoster(OFFICIAL_STUDENT_ROSTER);
+      } catch (error) {
+        console.error('Could not seed official student roster:', error);
+        setRosterError('No se pudo sincronizar el roster oficial.');
+      } finally {
+        setSeedingRoster(false);
+      }
+    };
+
+    loadRoster();
+
+    const unsubRoster = subscribeToStudentRoster((rosterList) => {
+      setRoster(rosterList);
+      setLoading(false);
+    }, (error) => {
+      console.error('Roster listener error:', error);
+      setRosterError('No se pudo leer el roster oficial.');
+      setLoading(false);
+    });
+
     const unsubUsers = subscribeToUsers((userList) => {
       setUsers(userList);
-      setLoading(false);
     });
 
     const unsubAttempts = subscribeToTeacherDashboard((attList) => {
@@ -26,26 +64,44 @@ export const TeacherStudentsView: React.FC = () => {
     });
 
     return () => {
+      unsubRoster();
       unsubUsers();
       unsubAttempts();
     };
   }, []);
 
-  const students = users.filter((u) => u.role === 'student');
 
-  // Count calculations
+  const students = roster.filter((s) => showInactive || s.active !== false);
+
+  const usersByEmail = new Map(
+    users.filter((u) => u.role === 'student').map((u) => [u.email.toLowerCase(), u])
+  );
+
+  // Merge official roster data with the authenticated user record so existing
+  // activity history, avatar and last-login data remain visible.
+  const displayStudents = students.map((entry) => {
+    const user = usersByEmail.get(entry.email.toLowerCase());
+
+    return {
+      ...entry,
+      uid: user?.uid || `roster_${entry.email}`,
+      photoURL: user?.photoURL || null,
+      lastLoginAt: user?.lastLoginAt || '',
+      user,
+    };
+  });
+
   const groupCounts: Record<StudentGroup, number> = {
-    '4A': students.filter((s) => s.studentGroup === '4A').length,
-    '4B': students.filter((s) => s.studentGroup === '4B').length,
-    '4C': students.filter((s) => s.studentGroup === '4C').length,
-    '5A': students.filter((s) => s.studentGroup === '5A').length,
-    '5B': students.filter((s) => s.studentGroup === '5B').length,
-    '5C': students.filter((s) => s.studentGroup === '5C').length,
+    '4A': students.filter((s) => s.group === '4A').length,
+    '4B': students.filter((s) => s.group === '4B').length,
+    '4C': students.filter((s) => s.group === '4C').length,
+    '5A': students.filter((s) => s.group === '5A').length,
+    '5B': students.filter((s) => s.group === '5B').length,
+    '5C': students.filter((s) => s.group === '5C').length,
   };
-  const unassignedCount = students.filter((s) => !s.studentGroup).length;
+  const unassignedCount = students.filter((s) => !s.group).length;
 
-  const filteredStudents = students.filter((s) => {
-    // Search query
+  const filteredStudents = displayStudents.filter((s) => {
     if (search.trim()) {
       const q = search.toLowerCase();
       const matchesSearch =
@@ -54,29 +110,90 @@ export const TeacherStudentsView: React.FC = () => {
       if (!matchesSearch) return false;
     }
 
-    // Group filter
     if (activeGroupFilter === 'ALL') return true;
-    if (activeGroupFilter === 'UNASSIGNED') return !s.studentGroup;
-    return s.studentGroup === activeGroupFilter;
+    if (activeGroupFilter === 'UNASSIGNED') return !s.group;
+    return s.group === activeGroupFilter;
   });
 
-  const handleGroupChange = async (studentUid: string, newGroup: StudentGroup) => {
-    setUpdatingUid(studentUid);
+
+  const handleGroupChange = async (
+    email: string,
+    newGroup: StudentGroup | null
+  ) => {
+    const key = email.toLowerCase();
+    setUpdatingKey(key);
+
     try {
-      await updateUserGroup(studentUid, newGroup);
-      setUsers((prev) =>
-        prev.map((u) => (u.uid === studentUid ? { ...u, studentGroup: newGroup } : u))
+      const grade = newGroup ? (newGroup.startsWith('4') ? '4' : '5') : null;
+      await updateStudentRosterEntry(email, newGroup, grade);
+
+      const user = usersByEmail.get(key);
+      if (user && newGroup) {
+        await updateUserGroup(user.uid, newGroup);
+      }
+
+      setRoster((prev) =>
+        prev.map((entry) =>
+          entry.email.toLowerCase() === key
+            ? { ...entry, group: newGroup, grade }
+            : entry
+        )
       );
     } catch (err) {
       console.error('Failed to change student group:', err);
+      setRosterError('No se pudo actualizar el grupo del estudiante.');
     } finally {
-      setTimeout(() => setUpdatingUid(null), 800);
+      setUpdatingKey(null);
+    }
+  };
+
+  const handleDeactivate = async (email: string) => {
+    const key = email.toLowerCase();
+    const student = roster.find((entry) => entry.email.toLowerCase() === key);
+    if (!student) return;
+
+    const confirmed = window.confirm(
+      `¿Desactivar a ${student.name}?\n\nEl estudiante no podrá ingresar, pero su historial académico se conservará.`
+    );
+    if (!confirmed) return;
+
+    setUpdatingKey(key);
+    try {
+      await setStudentRosterActive(email, false);
+      setRoster((prev) =>
+        prev.map((entry) =>
+          entry.email.toLowerCase() === key ? { ...entry, active: false } : entry
+        )
+      );
+    } catch (err) {
+      console.error('Failed to deactivate student:', err);
+      setRosterError('No se pudo desactivar al estudiante.');
+    } finally {
+      setUpdatingKey(null);
+    }
+  };
+
+  const handleReactivate = async (email: string) => {
+    const key = email.toLowerCase();
+    setUpdatingKey(key);
+    try {
+      await setStudentRosterActive(email, true);
+      setRoster((prev) =>
+        prev.map((entry) =>
+          entry.email.toLowerCase() === key ? { ...entry, active: true } : entry
+        )
+      );
+    } catch (err) {
+      console.error('Failed to reactivate student:', err);
+      setRosterError('No se pudo reactivar al estudiante.');
+    } finally {
+      setUpdatingKey(null);
     }
   };
 
   // Group stats for current selection
   const groupAttempts = attempts.filter((a) =>
-    filteredStudents.some((s) => s.uid === a.studentUid)
+    filteredStudents.some((s) => s.user?.uid === a.studentUid)
   );
   const groupCompleted = groupAttempts.filter((a) => a.status === 'COMPLETED');
   const groupAvgScore =
@@ -110,6 +227,38 @@ export const TeacherStudentsView: React.FC = () => {
             onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-9 pr-3 py-2 text-sm rounded-xl border border-slate-200 focus:outline-hidden focus:ring-2 focus:ring-indigo-500 bg-white shadow-xs"
           />
+        </div>
+      </div>
+
+      {rosterError && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-2xl px-4 py-3 text-sm">
+          {rosterError}
+        </div>
+      )}
+
+      <div className="bg-indigo-50 border border-indigo-100 rounded-2xl px-4 py-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-bold text-indigo-900">
+            Roster oficial Montessori
+          </p>
+          <p className="text-xs text-indigo-700">
+            {roster.length} estudiantes sincronizados • Los grupos se administran desde este panel.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {seedingRoster && (
+            <span className="text-xs font-semibold text-indigo-700 flex items-center gap-1">
+              <UploadCloud className="w-4 h-4" />
+              Sincronizando...
+            </span>
+          )}
+                  <button
+          type="button"
+          onClick={() => setShowInactive((value) => !value)}
+          className="text-xs font-bold px-3 py-2 rounded-xl border border-indigo-200 bg-white text-indigo-700 hover:bg-indigo-50"
+        >
+          {showInactive ? 'Ocultar inactivos' : 'Mostrar inactivos'}
+        </button>
         </div>
       </div>
 
@@ -290,7 +439,9 @@ export const TeacherStudentsView: React.FC = () => {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {filteredStudents.map((student) => {
-            const studentAttempts = attempts.filter((a) => a.studentUid === student.uid);
+            const studentAttempts = student.user
+              ? attempts.filter((a) => a.studentUid === student.user.uid)
+              : [];
             const completed = studentAttempts.filter((a) => a.status === 'COMPLETED');
             const inProgress = studentAttempts.filter((a) => a.status === 'IN PROGRESS');
 
@@ -302,13 +453,13 @@ export const TeacherStudentsView: React.FC = () => {
                   )
                 : 0;
 
-            const isUpdating = updatingUid === student.uid;
-            const currentGroup = student.studentGroup;
+            const isUpdating = updatingKey === student.email.toLowerCase();
+            const currentGroup = student.group;
             const isGrade4 = currentGroup?.startsWith('4');
 
             return (
               <div
-                key={student.uid}
+                key={student.email}
                 className="bg-white rounded-3xl border border-slate-200/90 p-5 shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between"
               >
                 <div>
@@ -401,14 +552,16 @@ export const TeacherStudentsView: React.FC = () => {
                           id={`group-select-${student.uid}`}
                           value={currentGroup || ''}
                           onChange={(e) => {
-                            const val = e.target.value as StudentGroup;
-                            if (val) handleGroupChange(student.uid, val);
+                            const rawValue = e.target.value;
+                            const val = rawValue === '__UNASSIGNED__' ? null : (rawValue as StudentGroup);
+                            handleGroupChange(student.email, val);
                           }}
                           className="text-xs font-bold py-1 px-2.5 rounded-lg border border-slate-200 bg-white text-slate-700 hover:border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-2xs"
                         >
                           <option value="" disabled>
                             Seleccionar grupo...
                           </option>
+                          <option value="__UNASSIGNED__">Sin grupo</option>
                           <optgroup label="Grado 4°">
                             <option value="4A">Grupo 4A</option>
                             <option value="4B">Grupo 4B</option>
@@ -424,11 +577,37 @@ export const TeacherStudentsView: React.FC = () => {
                     </div>
                   </div>
 
-                  <div className="text-[10px] text-slate-400 flex items-center justify-between">
-                    <span>Último acceso:</span>
-                    <span className="font-medium text-slate-600">
-                      {new Date(student.lastLoginAt).toLocaleDateString()}
-                    </span>
+                  <div className="flex items-center justify-between gap-2 pt-1">
+                    <div className="text-[10px] text-slate-400">
+                      Último acceso:{' '}
+                      <span className="font-medium text-slate-600">
+                        {student.lastLoginAt
+                          ? new Date(student.lastLoginAt).toLocaleDateString()
+                          : 'Aún no ha ingresado'}
+                      </span>
+                    </div>
+
+                    {student.active !== false ? (
+                      <button
+                        type="button"
+                        onClick={() => handleDeactivate(student.email)}
+                        disabled={isUpdating}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[10px] font-bold text-red-700 bg-red-50 border border-red-200 hover:bg-red-100 disabled:opacity-50"
+                      >
+                        <UserX className="w-3 h-3" />
+                        Desactivar
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleReactivate(student.email)}
+                        disabled={isUpdating}
+                        className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-50"
+                      >
+                        <UserCheck className="w-3 h-3" />
+                        Reactivar
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
