@@ -8,10 +8,18 @@ import {
   onSnapshot,
   query,
   where,
+  writeBatch,
   Unsubscribe,
 } from 'firebase/firestore';
 import { db } from './firebase';
-import { ActivityAttempt, StudentAnswer, AttemptStatus, AppUser } from '../types';
+import {
+  ActivityAttempt,
+  StudentAnswer,
+  AttemptStatus,
+  AppUser,
+  ActivityGrade,
+  StudentGroup,
+} from '../types';
 
 export const DEPRECATED_TEST_ACTIVITY_IDS = [
   'continents-and-oceans-explorer',
@@ -443,6 +451,112 @@ export function subscribeToTeacherDashboard(
 }
 
 /**
+ * Official student roster entry.
+ * The document ID is the student's normalized institutional email.
+ */
+export type StudentRosterEntry = {
+  email: string;
+  name: string;
+  group: StudentGroup;
+  grade: ActivityGrade;
+  active: boolean;
+};
+
+/**
+ * Creates or updates the official student roster in Firestore.
+ * This function is teacher-only through Firestore Security Rules.
+ */
+export async function seedStudentRoster(
+  roster: StudentRosterEntry[]
+): Promise<number> {
+  const rosterRef = collection(db, 'student_roster');
+  const batch = writeBatch(db);
+
+  for (const student of roster) {
+    const email = student.email.toLowerCase().trim();
+
+    batch.set(
+      doc(rosterRef, email),
+      {
+        email,
+        name: student.name,
+        group: student.group,
+        grade: student.grade,
+        active: student.active,
+      },
+      { merge: true }
+    );
+  }
+
+  await batch.commit();
+  return roster.length;
+}
+
+/**
+ * Updates one student's official group/grade.
+ * Student history in activity_attempts is preserved.
+ */
+export async function updateStudentRosterEntry(
+  email: string,
+  group: StudentGroup,
+  grade: ActivityGrade
+): Promise<void> {
+  const normalizedEmail = email.toLowerCase().trim();
+
+  await setDoc(
+    doc(db, 'student_roster', normalizedEmail),
+    {
+      email: normalizedEmail,
+      group,
+      grade,
+      active: true,
+    },
+    { merge: true }
+  );
+}
+
+/**
+ * Activates or deactivates a student without deleting academic history.
+ */
+export async function setStudentRosterActive(
+  email: string,
+  active: boolean
+): Promise<void> {
+  const normalizedEmail = email.toLowerCase().trim();
+
+  await setDoc(
+    doc(db, 'student_roster', normalizedEmail),
+    { active },
+    { merge: true }
+  );
+}
+
+/**
+ * Listens to the official student roster for Teacher View.
+ */
+export function subscribeToStudentRoster(
+  callback: (students: StudentRosterEntry[]) => void,
+  onError?: (error: Error) => void
+): Unsubscribe {
+  const rosterRef = collection(db, 'student_roster');
+
+  return onSnapshot(
+    rosterRef,
+    (snapshot) => {
+      const students = snapshot.docs
+        .map((snapshotDoc) => snapshotDoc.data() as StudentRosterEntry)
+        .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+      callback(students);
+    },
+    (error) => {
+      console.error('Error in student roster listener:', error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+/**
  * Listens to all users for the teacher dashboard.
  */
 export function subscribeToUsers(
@@ -548,6 +662,11 @@ export async function saveColombianSymbolsProgress(
       answers: {},
       totalQuestions: 10,
       score: 0,
+      percentage: 0,
+      ...updateData,
+    } as ActivityAttempt;
+  }
+}
       percentage: 0,
       ...updateData,
     } as ActivityAttempt;
